@@ -114,5 +114,36 @@ class Env(ABC):
 5. `molt/models/base.py`（dispatcher 部分）—— MoE 实战坑
 6. 技术报告 arXiv:2607.21653
 
+## 11. 与 OpenRLHF 的对照（2026-10-07 补充）
+
+### 血缘：实锤的"换血"而非"分家"
+
+- Molt 55 个文件中有 **22 个（40%）带 "Adapted from OpenRLHF" 署名头**；`kl_controller.py` 除署名外与 OpenRLHF 版逐行相同。
+- OpenRLHF 的 README 明确背书 Molt 为 "New Backend…more powerful than DeepSpeed"；hijkz 两边都在提交。
+- 移植策略：**数据/rollout 机器全搬**（samples_generator、experience_maker、replay_buffer、kl_controller、datasets），**训练后端全换**（DeepSpeed → AutoModel/FSDP2），**agent 合约是新增的**（OpenRLHF 没有 `Env`/`Runner`/`Trajectory`）。
+- 早期"NV 员工个人项目 vs 公司项目"的 tension，已通过规范开源署名 + README 互链解决。
+
+### OpenRLHF 被放弃了吗？没有，是分工
+
+- 没放弃：2026-09 仍有 hijkz / Excelius / Jiang Wu 的提交，10K stars，393 个 open issue 说明社区还在。
+- 但提交全是维护级（SFT 修、DeepSpeed 升版、文档）；新 R&D（FlashREINFORCE、agentic、1T MoE）全在 Molt。
+- **双向流动**：FlashREINFORCE 是 Molt 首发，2026-09 被 backport 回 OpenRLHF（hijkz 亲自提交）。
+- OpenRLHF 自己也在加 agentic（`openrlhf/utils/agent.py` + `examples/python/agent_func*.py`），没躺平。
+- 判断：**OpenRLHF = stable/community track，Molt = R&D 前沿**。
+
+### 对照出的新发现
+
+1. **Molt 不是纯 critic-free**：`train_rl_ray.py:159`，`--algo.advantage.estimator=gae` 时会实例化 critic（`critic_actor.py` 是活代码）。FlashREINFORCE 是 critic-free，但 PPO+critic 的路还留着。
+2. **Molt 的 `compute_eval_metrics` 已正确处理加权问题**：按 group_id 分组、防 multi-turn 重复计数、防 dropped rollout 错位——SDAR 那类 unweighted batch-mean bug 在 Molt 不存在。（另：SDAR #62 的修法，OpenRLHF 自己 2026-09 才在 #1336 修了同类问题。）
+3. **Porting gap**：OpenRLHF 的 `ppo_utils/` 6 个模块中，5 个搬到了 Molt，唯独 **`length_penalty.py`（DAPO overlong penalty + ProRL stop-properly penalty）没搬**。Experience 格式完全兼容，port 很直接；但 Molt 主打 agentic（多轮 tool-use 里 length penalty 不常用），漏掉可能是有意的——当 feature PR 需三思。
+4. 两边 `.claude` + `AGENTS.md` 的 AI-dev 配置一模一样，同一个作者的手笔。
+
+### 对贡献思路的影响
+
+- 经对照，Molt 当前确实无高价值 PR 切入点（§9 结论维持）：代码干净、eval 聚合正确、issue 池无合适项。
+- 唯一候选是 port `length_penalty.py`，但属 feature 且可能有意省略，暂不推进。
+- Watch 点更新：OpenRLHF 的 bug fix（如 2026-09 的 SFT 系列修）是否会被同步到 Molt 的对应 "Adapted" 文件——目前看没有同步机制，可长期观察。
+
+---
 ---
 *本文档为个人学习笔记，放在自己 fork 上，不进上游。*
