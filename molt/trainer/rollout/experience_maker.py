@@ -31,7 +31,6 @@ from molt.trainer.algorithm.advantage import (
     get_advantage_estimator,
 )
 from molt.trainer.algorithm.experience import Experience
-from molt.trainer.algorithm.length_penalty import apply_length_penalties
 from molt.utils.logging_utils import init_logger
 
 if TYPE_CHECKING:
@@ -162,6 +161,12 @@ class RemoteExperienceMaker:
             groups            = [[0, 1], [2]]     # rollout rows grouped by prompt (g0, g1)
             sample_to_rollout = [0, 0, 1, 2, 2]   # (S=5) sample i -> its rollout's row in `rewards`
             exp_len           = [3, 2]            # samples per experience, to re-split later
+
+        Also returns per-rollout generation stats for the length penalties: `response_length`
+        (generated tokens summed over segments), `truncated` (any segment truncated), and
+        `prompt_len` (initial prompt size, min over segments — robust to post-balance
+        reordering). These are None when the samples don't carry the fields; the penalty
+        hook raises a clear error if a penalty flag is set without them.
         """
         exp_len = [len(e.index) for e in experiences]
         ids = [rollout_and_group_ids(e) for e in experiences]
@@ -185,11 +190,33 @@ class RemoteExperienceMaker:
                 prompt_groups.setdefault(gid, []).append(first_seen[rid])
             sample_to_rollout.append(first_seen[rid])
 
+        s2r = torch.tensor(sample_to_rollout, dtype=torch.long)
+        n_rollouts = len(rollout_rewards)
+        # Per-rollout reductions for the length penalties. Order-invariant by construction:
+        # generated tokens sum over segments, truncation is any-segment, prompt takes the
+        # min over segments (the initial prompt; later segments' prompts include history).
+        gen = [e.response_length for e in experiences]
+        trunc = [e.truncated for e in experiences]
+        total = [e.total_length for e in experiences]
+        if all(v is not None for v in gen + trunc + total):
+            gen_t = torch.cat(gen, dim=0).float()
+            prompt_t = (torch.cat(total, dim=0).float() - gen_t).clamp(min=0)
+            response_length = torch.zeros(n_rollouts).index_add(0, s2r, gen_t)
+            truncated = torch.zeros(n_rollouts).index_add(0, s2r, torch.cat(trunc, dim=0).float()).bool()
+            prompt_len = torch.full((n_rollouts,), float("inf")).scatter_reduce(
+                0, s2r, prompt_t, reduce="amin", include_self=True
+            )
+        else:
+            response_length = truncated = prompt_len = None
+
         return {
             "rewards": torch.stack(rollout_rewards),
             "groups": list(prompt_groups.values()),
-            "sample_to_rollout": torch.tensor(sample_to_rollout),
+            "sample_to_rollout": s2r,
             "exp_len": exp_len,
+            "response_length": response_length,
+            "truncated": truncated,
+            "prompt_len": prompt_len,
         }
 
     @staticmethod
@@ -203,42 +230,79 @@ class RemoteExperienceMaker:
         """
         rewards = torch.cat([e.rewards for e in experiences], dim=0)
         n = rewards.numel()
+        gen = [e.response_length for e in experiences]
+        trunc = [e.truncated for e in experiences]
+        total = [e.total_length for e in experiences]
+        has_fields = all(v is not None for v in gen + trunc + total)
         return {
             "rewards": rewards,
             "groups": [[i] for i in range(n)],
             "sample_to_rollout": torch.arange(n),
             "exp_len": [len(e.index) for e in experiences],
+            # Identity "reductions": each sample is its own rollout on this path.
+            "response_length": torch.cat(gen, dim=0).float() if has_fields else None,
+            "truncated": torch.cat(trunc, dim=0).bool() if has_fields else None,
+            "prompt_len": (torch.cat(total, dim=0).float() - torch.cat(gen, dim=0).float()).clamp(min=0)
+            if has_fields
+            else None,
         }
 
     @torch.no_grad()
     def compute_advantages_and_returns(self, experiences: List[Experience]) -> List[Experience]:
-        """Clip rewards, run the estimator (which returns per-token advantages/returns), assemble onto exps.
+        """Apply length penalties, clip rewards, run the estimator, assemble onto exps.
 
         Estimators live in `advantage.py` and never see `Experience`: this method extracts the small
         tensor inputs (rewards, action masks, per-token KL), builds the `AdvantageContext`, and
         writes the returned advantages/returns/info back onto each experience. Only the group
         baselines merge multi-turn step-samples to one reward per rollout; reinforce/gae score
-        each sample independently (see `_per_sample_rewards`).
+        each sample independently (see `_per_sample_rewards`). Length penalties (when enabled)
+        apply to the merged per-rollout rewards before the clip.
         """
         args = self.args
-        # Length penalties (DAPO overlong / ProRL stop-properly), ported from OpenRLHF.
-        # Applied per-sample before reward merging so each sample's own length/truncation
-        # shapes its reward; no-op unless the --reward.* penalty flags are set. Rewards are
-        # promoted to at least FP32 first so the penalty math doesn't lose precision.
-        for experience in experiences:
-            experience.rewards = experience.rewards.to(
-                torch.promote_types(experience.rewards.dtype, torch.float32)
-            )
-        apply_length_penalties(experiences, args)
-
         if self.advantage_estimator in GROUP_ADVANTAGE_ESTIMATORS:
             rollouts = self._merge_rollout_rewards(experiences)
         else:
             rollouts = self._per_sample_rewards(experiences)
 
-        # Clip the raw per-rollout reward before the baseline.
+        # Length penalties (DAPO overlong / ProRL stop-properly), ported from OpenRLHF.
+        # Applied to the MERGED per-rollout rewards — after the first-seen merge, before
+        # the clip — so multi-segment rollouts get a single order-invariant penalty.
+        # Multi-turn aware: the overlong check compares the rollout's full context
+        # footprint (prompt + generated tokens, summed over segments) against data.max_len.
+        # No-op unless the --reward.* penalty flags are set. info["reward"] keeps the raw
+        # reward; penalty amounts land in info["length_penalty"] and friends.
+        rewards = rollouts["rewards"].float()
+        buf = getattr(args.reward, "overlong_buffer_len", None)
+        coef = getattr(args.reward, "stop_properly_penalty_coef", None)
+        overlong_pen = torch.zeros_like(rewards)
+        sp_pen = torch.zeros_like(rewards)
+        if buf is not None or coef is not None:
+            if rollouts["response_length"] is None:
+                raise ValueError(
+                    "length penalties need Experience.response_length/truncated/total_length on every sample"
+                )
+            if buf is not None:
+                total = rollouts["prompt_len"] + rollouts["response_length"]
+                exceed = (total - (args.data.max_len - buf)).clamp(0, buf)
+                overlong_pen = -exceed / buf * args.reward.overlong_penalty_factor
+                rewards = rewards + overlong_pen
+            if coef is not None:
+                penalized = torch.full_like(rewards, coef) if coef < 0 else rewards * coef
+                sp_pen = torch.where(rollouts["truncated"], penalized - rewards, torch.zeros_like(rewards))
+                rewards = torch.where(rollouts["truncated"], penalized, rewards)
+            s2r = rollouts["sample_to_rollout"]
+            exp_len = rollouts["exp_len"]
+            tot_s = (overlong_pen + sp_pen)[s2r].split(exp_len)
+            op_s = overlong_pen[s2r].split(exp_len)
+            sp_s = sp_pen[s2r].split(exp_len)
+            for exp, tot, op, sp in zip(experiences, tot_s, op_s, sp_s):
+                exp.info["length_penalty"] = tot
+                exp.info["overlong_penalty"] = op
+                exp.info["stop_properly_penalty"] = sp
+
+        # Clip the penalized per-rollout reward before the baseline.
         clip = args.reward.clip_range
-        rewards = rollouts["rewards"].clamp(min=clip[0], max=clip[1]) if clip else rollouts["rewards"]
+        rewards = rewards.clamp(min=clip[0], max=clip[1]) if clip else rewards
 
         # PPO/gae is the only estimator that consumes a learned value baseline; the
         # critic filled exp.values during make_experience. Other estimators ignore it.
