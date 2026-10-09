@@ -49,6 +49,24 @@ def _ray_runtime_env_vars():
     return env_vars
 
 
+def validate_length_penalty_args(args):
+    """Fail-fast config check for the DAPO overlong / ProRL stop-properly penalties.
+
+    The advantage hook assumes valid config. The overlong threshold compares the rollout's
+    full context footprint against data.max_len, so the buffer must be a positive length
+    within that budget (rollout.max_new_tokens is not consulted).
+    """
+    if args.reward.overlong_buffer_len is not None:
+        buf = args.reward.overlong_buffer_len
+        if not buf > 0:
+            raise ValueError("--reward.overlong_buffer_len must be positive")
+        if buf > args.data.max_len:
+            raise ValueError("--reward.overlong_buffer_len must not exceed --data.max_len")
+    coef = args.reward.stop_properly_penalty_coef
+    if coef is not None and coef > 1:
+        raise ValueError("--reward.stop_properly_penalty_coef must be <= 1 (scale) or negative (override)")
+
+
 def train(args):
     import ray
     from ray.util.placement_group import placement_group
@@ -605,8 +623,10 @@ if __name__ == "__main__":
         "--reward.overlong_buffer_len",
         type=float,
         default=None,
-        help="DAPO-style overlong penalty: soft-penalize responses exceeding "
-        "rollout.max_new_tokens - overlong_buffer_len. Unset disables it.",
+        help="DAPO-style overlong penalty: soft-penalize rollouts whose total tokens "
+        "(prompt + generated, summed over segments) exceed data.max_len - overlong_buffer_len. "
+        "Multi-turn aware: compares the rollout's full context footprint against the context "
+        "budget. Unset disables it.",
     )
     parser.add_argument(
         "--reward.overlong_penalty_factor",
@@ -618,8 +638,10 @@ if __name__ == "__main__":
         "--reward.stop_properly_penalty_coef",
         type=float,
         default=None,
-        help="ProRL-style stop-properly penalty: scale truncated-sample rewards by this "
-        "coefficient in [0, 1], or set them to this value if negative. Unset disables it.",
+        help="ProRL-style stop-properly penalty: scale truncated-rollout rewards by this "
+        "coefficient in [0, 1], or set them to this value if negative. Note: 'truncated' in "
+        "Molt covers vLLM finish_reason=length AND context exhaustion AND env turn caps. "
+        "Unset disables it.",
     )
 
     # Rollout / generation
@@ -968,6 +990,9 @@ if __name__ == "__main__":
             "RL rollout currently requires vLLM. Set --vllm.num_engines > 0; "
             "actor-side generation fallback is not wired in this AutoModel path."
         )
+
+    # --- Length penalties (DAPO overlong / ProRL stop-properly) ---
+    validate_length_penalty_args(args)
 
     # --- Algorithm setup & defaults ---
     threshold = args.algo.advantage.is_correction_threshold

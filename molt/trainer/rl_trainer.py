@@ -378,6 +378,14 @@ class BaseRLTrainer:
             "rollout/truncated_rate": truncated.float().mean().item(),
             "rollout/num_samples": float(num_turn_rows),
         }
+        # Length-penalty observability: fraction of train-batch samples carrying a nonzero
+        # penalty of each kind. info["reward"] keeps the raw reward; the penalty amounts
+        # live in their own info keys (see experience_maker.compute_advantages_and_returns).
+        if experiences and "overlong_penalty" in experiences[0].info:
+            overlong_pen = torch.cat([e.info["overlong_penalty"] for e in experiences])
+            sp_pen = torch.cat([e.info["stop_properly_penalty"] for e in experiences])
+            rollout_stats["rollout/overlong_frac"] = (overlong_pen != 0).float().mean().item()
+            rollout_stats["rollout/truncated_penalized"] = (sp_pen != 0).float().mean().item()
 
         # Push the experiences to the actor shards (and the critic, which trains on the same batch
         # with values + returns) before optimization. Each rank fetches its samples' heavy tensors
