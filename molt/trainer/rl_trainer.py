@@ -378,7 +378,6 @@ class BaseRLTrainer:
             "rollout/truncated_rate": truncated.float().mean().item(),
             "rollout/num_samples": float(num_turn_rows),
         }
-
         # Push the experiences to the actor shards (and the critic, which trains on the same batch
         # with values + returns) before optimization. Each rank fetches its samples' heavy tensors
         # from the producing runner via reload() — the images reach the rank straight from the
@@ -783,10 +782,13 @@ class GenerateSamplesActor:
                         logger.info(f"[rollout_dump] wrote {len(rollout_samples)} samples to {dump_path}")
 
                 if rollout_samples:
+                    # Once the epoch's prompts are all dispatched, a resume must start the next
+                    # episode on a fresh loader (see SamplesGenerator.prompts_drained).
+                    drained = self.samples_generator.prompts_drained
                     client_states = {
-                        "episode": ep,
+                        "episode": ep + 1 if drained else ep,
                         "total_consumed_prompts": total_consumed_prompts,
-                        "data_loader_state_dict": self.prompts_dataloader.state_dict(),
+                        "data_loader_state_dict": {} if drained else self.prompts_dataloader.state_dict(),
                         "rollout_generator_state_dict": self.samples_generator.state_dict(),
                     }
                     self.rollout_queue.put(
