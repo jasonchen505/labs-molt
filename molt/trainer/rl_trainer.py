@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import asyncio
+import copy
 import os
 import statistics
 import time
@@ -622,16 +623,8 @@ class GenerateSamplesActor:
         from molt.trainer.rollout.router import AgentRunnerActor
 
         num_runners = max(1, getattr(strategy.args.rollout, "num_runners", 2))
-        # SPREAD the runners across the cluster. AgentRunnerActor already asks for num_cpus=1 so
-        # that Ray *can* balance it, and the comment on that decorator assumes SPREAD is in
-        # effect -- but nothing ever passed it, and Ray's default packs onto the first node with
-        # room. A node with dozens of free CPUs has room for every runner, so all of them land
-        # there, and so do all of their desktop-env VMs.
-        #
-        # Measured on an OSWorld run: every AgentRunnerActor reported the same ip, putting 128
-        # containers on one node. That node hands out 128 x 4 ports from the provider's ranges,
-        # which is where port collisions begin; osworld_error climbed 4% -> 54% within eleven
-        # steps while mean episode length fell 63 -> 19, i.e. rollouts dying at setup.
+        # SPREAD the runners: Ray's default PACK lands every runner (and its desktop-env VM) on the
+        # first node with free CPUs, and that node's port range then runs out.
         agent_runners = [
             AgentRunnerActor.options(scheduling_strategy="SPREAD").remote(
                 strategy.args.train.agent_path, router_url, model_path=pretrain
@@ -778,7 +771,10 @@ class GenerateSamplesActor:
                     if self.args.train.rollout_dump_dir and rollout_samples:
                         os.makedirs(self.args.train.rollout_dump_dir, exist_ok=True)
                         dump_path = os.path.join(self.args.train.rollout_dump_dir, f"rollout_step{global_step}.pt")
-                        torch.save(rollout_samples, dump_path)
+                        # The samples are lazy Experiences whose tensors live in the runners' object
+                        # stores (heavy_ref); those handles die with this job, so materialize local
+                        # copies first — the dump must replay in another job (and offline).
+                        torch.save([copy.copy(s).reload() for s in rollout_samples], dump_path)
                         logger.info(f"[rollout_dump] wrote {len(rollout_samples)} samples to {dump_path}")
 
                 if rollout_samples:
@@ -815,7 +811,7 @@ class GenerateSamplesActor:
         eval_n = self.args.eval.n_samples_per_prompt
         if eval_n is None:
             eval_n = self.args.rollout.n_samples_per_prompt
-        eval_kwargs = {**self.generate_kwargs, "n_samples_per_prompt": eval_n}
+        eval_kwargs = {**self.generate_kwargs, "n_samples_per_prompt": eval_n, "top_logprobs": 0}  # eval never trains
         for key in ("temperature", "top_p", "max_new_tokens"):
             override = getattr(self.args.eval, key)
             if override is not None:

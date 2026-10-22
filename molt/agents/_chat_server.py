@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+import warnings
 from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any
@@ -172,17 +173,16 @@ def _anthropic_message_body(model_name: str, content: str, finish_reason: str) -
 
 
 def _build_sampling_params(base_sampling, body: dict):
-    """One vLLM SamplingParams per chat call: inherit THIS rollout's defaults (its train-vs-eval
-    temperature / max_tokens — see ``_Session.sampling_params``), honor the caller's temperature /
-    max_tokens, and force logprobs on (importance-sampling correction needs token logprobs)."""
+    """One vLLM SamplingParams per chat call: this rollout's temperature / top_p (see
+    ``_Session.sampling_params``; the trainer recomputes log-probs at exactly these, so a caller's own
+    values would skew every importance ratio), the caller's max_tokens, and logprobs forced on."""
     sp = deepcopy(base_sampling)
     requested = body.get("max_completion_tokens", body.get("max_tokens"))
     if requested is not None:
         sp.max_tokens = int(requested)
-    if body.get("temperature") is not None:
-        sp.temperature = float(body["temperature"])
-    if body.get("top_p") is not None:
-        sp.top_p = float(body["top_p"])
+    for knob in ("temperature", "top_p"):
+        if body.get(knob) is not None and float(body[knob]) != getattr(sp, knob):
+            warnings.warn(f"chat request {knob}={body[knob]} ignored: this rollout samples at {getattr(sp, knob)}")
     if sp.logprobs is None:
         sp.logprobs = 1
     return sp
@@ -196,8 +196,8 @@ class _Session:
     prompt: str
     label: Any
     images: list | None
-    # This rollout's id, reused as the router ``x-session-id`` so all turns (and each turn's
-    # render + generate) pin to one engine (consistent_hash) — see ``RouterGenerateClient.generate``.
+    # This rollout's id, reused as the router ``x-session-id`` (the consistent_hash routing key; the
+    # default cache_aware pins by token prefix) — see ``RouterGenerateClient.generate``.
     session_id: str | None = None
     # THIS rollout's SamplingParams (carries the train-vs-eval temperature / max_tokens for this
     # call). Used as the per-turn default before the agent's own body overrides it; the fallback is
@@ -317,6 +317,7 @@ async def _run_turn(state: ChatServerState, session: _Session, body: dict) -> tu
             pil_images=pil_images,
             image_budget=image_budget,
             rollout_log_probs=[0.0] * len(prompt_ids),
+            rollout_top_logprobs=[] if (sp.logprobs or 0) > 1 else None,
         )
         gen_tokens = traj.observation_tokens
     else:
@@ -392,7 +393,12 @@ async def _run_turn(state: ChatServerState, session: _Session, body: dict) -> tu
     traj.truncated = traj.truncated or finish_reason == "length"
     # off_policy_len: leading tokens generated under stale weights when a broadcast landed
     # mid-request (per-token IS still corrects them); the transport reports it, same as the step runner.
-    traj.append_action(action_ids, action_logprobs, off_policy_len=off_policy_len)
+    traj.append_action(
+        action_ids,
+        action_logprobs,
+        off_policy_len=off_policy_len,
+        action_top_logprobs=getattr(generation, "top_logprobs", None),
+    )
     # R3: absorb this turn's prefill+gen routing by absolute position (first-writer-wins). The full
     # prefill covers the prior action's trailing token too, so the turn-boundary backfills naturally.
     traj.absorb_routing(request_output)

@@ -90,10 +90,14 @@ def compute_approx_kl(
 
 
 def log_probs_from_logits(logits: torch.Tensor, labels: torch.Tensor, temperature: float = 1.0) -> torch.Tensor:
+    """Log-probs of ``labels`` under ``logits``: one target per position (returns ``logits.shape[:-1]``)
+    or several (``labels`` with a trailing ``k`` dim, e.g. the sampler's top-k ids; returns
+    ``logits.shape[:-1] + (k,)``)."""
     batch_dim = logits.shape[:-1]
     last_dim = logits.shape[-1]
     flat_logits = logits.reshape(-1, last_dim)
-    flat_labels = labels.reshape(-1)
+    flat_labels = labels.reshape(flat_logits.shape[0], -1)
+    several = labels.numel() != flat_logits.shape[0]  # a trailing k dim; labels may be 1-D under CP
 
     # Both paths below scale at fp32, never on a bf16 input: rounding the quotient back to bf16
     # costs ~1 ULP per logit on top of the logits' own quantization. Non-inplace — callers keep
@@ -101,12 +105,12 @@ def log_probs_from_logits(logits: torch.Tensor, labels: torch.Tensor, temperatur
     #
     # Fast path: fused triton CE kernel only supports fp32/fp64.
     # https://github.com/OpenRLHF/OpenRLHF/pull/718#issuecomment-2641081881
-    if logits.dtype in [torch.float32, torch.float64]:
+    if logits.dtype in [torch.float32, torch.float64] and not several:
         try:
             from flash_attn.ops.triton.cross_entropy import cross_entropy_loss
 
             scaled = flat_logits / temperature if temperature != 1.0 else flat_logits
-            output = cross_entropy_loss(scaled, flat_labels)
+            output = cross_entropy_loss(scaled, flat_labels.squeeze(-1))
             return (-output[0]).view(*batch_dim)
         except ImportError:
             pass
@@ -122,7 +126,7 @@ def log_probs_from_logits(logits: torch.Tensor, labels: torch.Tensor, temperatur
         chunk = chunk_logits.float()
         if temperature != 1.0:
             chunk = chunk / temperature
-        return chunk.gather(dim=-1, index=chunk_labels.unsqueeze(-1)).squeeze(-1) - torch.logsumexp(chunk, dim=-1)
+        return chunk.gather(dim=-1, index=chunk_labels) - torch.logsumexp(chunk, dim=-1, keepdim=True)
 
     chunk_size = 256
     out = []
@@ -130,7 +134,8 @@ def log_probs_from_logits(logits: torch.Tensor, labels: torch.Tensor, temperatur
         chunk_logits = flat_logits[start : start + chunk_size]
         chunk_labels = flat_labels[start : start + chunk_size]
         out.append(torch.utils.checkpoint.checkpoint(chunk_log_probs, chunk_logits, chunk_labels, use_reentrant=False))
-    return torch.cat(out).view(*batch_dim)
+    out = torch.cat(out)
+    return out.view(*batch_dim, -1) if several else out.view(*batch_dim)
 
 
 def masked_mean(tensor: torch.Tensor, mask: Optional[torch.Tensor], dim: int = None) -> torch.Tensor:
@@ -139,6 +144,27 @@ def masked_mean(tensor: torch.Tensor, mask: Optional[torch.Tensor], dim: int = N
     valid = torch.where(mask.bool(), tensor, torch.zeros_like(tensor))
     denom = mask.sum(dim=dim).clamp_min(1)
     return valid.sum(dim=dim) / denom
+
+
+def mismatch_metrics(rollout_log_probs: torch.Tensor, train_log_probs: torch.Tensor, mask: torch.Tensor) -> dict:
+    """Train-inference consistency of the sampled-token logprobs over the valid tokens.
+
+    ``bitwise_frac`` is the fraction of valid tokens whose fp32 logprob bytes differ between the
+    rollout engine and this forward; 0 with valid tokens is the bitwise pass. The others are
+    diagnostics on d = train - rollout: mean |d| and the k3 KL estimate exp(d) - 1 - d. All three
+    are masked means, so the token-weighted reduction over microbatches and ranks stays exact
+    (a max would not survive that reduction; replay comparisons report it).
+    """
+    valid = mask.bool()
+    rollout = rollout_log_probs.float().contiguous()
+    train = train_log_probs.detach().float().contiguous()
+    d = torch.where(valid, train - rollout, torch.zeros_like(train))
+    differs = (rollout.view(torch.int32) != train.view(torch.int32)).float()
+    return {
+        "mismatch/bitwise_frac": masked_mean(differs, valid),
+        "mismatch/abs_diff_mean": masked_mean(d.abs(), valid),
+        "mismatch/k3_kl": masked_mean(d.exp() - 1 - d, valid),
+    }
 
 
 @torch.compile

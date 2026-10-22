@@ -93,11 +93,14 @@ def train(args):
             args.vllm.enforce_eager,
             max_len,
             args.vllm.gpu_memory_utilization,
-            "processed_logprobs" if args.algo.advantage.is_correction_level != "off" else None,
+            "processed_logprobs"
+            if args.algo.advantage.is_correction_level != "off" or args.algo.advantage.score_centering_top_k
+            else None,
             max_images_per_prompt=getattr(args.data, "max_images_per_prompt", 0),
             mm_encoder_attn_backend=args.vllm.mm_encoder_attn_backend,
             gdn_prefill_backend=args.vllm.gdn_prefill_backend,
             attention_backend=args.vllm.attention_backend,
+            moe_backend=args.vllm.moe_backend,
             mamba_ssm_cache_dtype=args.vllm.mamba_ssm_cache_dtype,
             distributed_executor_backend=args.vllm.distributed_executor_backend,
             enable_expert_parallel=args.vllm.enable_expert_parallel,
@@ -113,6 +116,7 @@ def train(args):
             enable_return_routed_experts=args.train.routing_replay,
             pipeline_parallel_size=getattr(args.vllm, "pipeline_parallel_size", 1),
             data_parallel_size=getattr(args.vllm, "data_parallel_size", 1),
+            max_logprobs=args.algo.advantage.score_centering_top_k,
         )
 
     # Rollout gateway: serve each engine's OpenAI API + the real vllm-router in front of them.
@@ -125,7 +129,9 @@ def train(args):
         from molt.trainer.rollout.router import create_vllm_router
 
         vllm_router, router_url = create_vllm_router(
-            vllm_engines, policy=getattr(args.vllm, "router_policy", "consistent_hash")
+            vllm_engines,
+            policy=args.vllm.router_policy,
+            balance=(args.vllm.router_balance_abs, args.vllm.router_balance_rel),
         )
         print(f"[rollout] gateway up at {router_url} fronting {len(vllm_engines)} engines", flush=True)
 
@@ -138,6 +144,8 @@ def train(args):
         "max_new_tokens": args.rollout.max_new_tokens,
         "temperature": args.rollout.temperature,
         "top_p": args.rollout.top_p,
+        # Score centering trains on the sampler's top-k per token; 0 = sampled-token log-prob only.
+        "top_logprobs": args.algo.advantage.score_centering_top_k,
     }
 
     # Eval-only: score --eval.dataset once and exit, with NO training. vLLM already holds the HF
@@ -514,6 +522,16 @@ if __name__ == "__main__":
         "gradient), clip (clamp the weight into [low, high]), trunc (clamp only the upper tail).",
     )
     parser.add_argument(
+        "--algo.advantage.score_centering_top_k",
+        type=int,
+        default=0,
+        help="Score centering (https://arxiv.org/abs/2609.20807): record the rollout sampler's top-k log-probs per "
+        "generated token and subtract its expected score from the policy loss, so vLLM/trainer drift cancels "
+        "without an importance ratio. 0 = off; the paper uses 128 and reports 32 within noise at a quarter of the "
+        "payload. Needs one update per batch (--train.max_epochs 1), --rollout.top_p 1.0 and fsdp tp_size 1; "
+        "composes with is_correction_level token (mode trunc/clip/mask = the paper's TIS/MIS variants).",
+    )
+    parser.add_argument(
         "--algo.advantage.is_correction_threshold",
         type=float,
         nargs="+",
@@ -663,9 +681,25 @@ if __name__ == "__main__":
     parser.add_argument(
         "--vllm.router_policy",
         type=str,
-        default="consistent_hash",
-        help="vllm-router policy (default consistent_hash: x-session-id affinity pins a rollout's "
-        "render+generate to one engine for mm-feature cache; cache_aware | round_robin | power_of_two | random)",
+        default="cache_aware",
+        help="vllm-router policy (default cache_aware: token-prefix affinity keeps a rollout's turns on one "
+        "engine and falls back to the shortest queue when engines are imbalanced; "
+        "consistent_hash | round_robin | power_of_two | random)",
+    )
+    parser.add_argument(
+        "--vllm.router_balance_abs",
+        type=int,
+        default=10,
+        help="cache_aware keeps a rollout's turns on one engine until (max_in_flight - min_in_flight) "
+        "exceeds this AND max > --vllm.router_balance_rel * min. The router's own 64 is sized for a "
+        "serving fleet and is unreachable when one batch puts rollout.generate_batch_size requests in "
+        "flight; vime runs this workload at 10.",
+    )
+    parser.add_argument(
+        "--vllm.router_balance_rel",
+        type=float,
+        default=1.2,
+        help="The ratio half of the cache_aware load-balance trigger (router default 1.5; vime 1.2).",
     )
     parser.add_argument(
         "--vllm.mtp_num_speculative_tokens",
@@ -701,6 +735,13 @@ if __name__ == "__main__":
         default=None,
         help="Optional vLLM attention backend (FLASH_ATTN/FLASHINFER/TRITON_ATTN/FLEX_ATTENTION). "
         "Pass TRITON_ATTN to bypass AOT-compiled FA2/FlashInfer kernels on older drivers.",
+    )
+    parser.add_argument(
+        "--vllm.moe_backend",
+        type=str,
+        default=None,
+        help="Optional vLLM fused-MoE kernel backend (triton, flashinfer_trtllm, flashinfer_cutlass; default: "
+        "vLLM's choice, FlashInfer TRT-LLM for bf16 MoE on Blackwell).",
     )
     parser.add_argument(
         "--vllm.block_size",
@@ -742,14 +783,8 @@ if __name__ == "__main__":
             "is unavailable or incompatible."
         ),
     )
-    # vLLM throughput features. We leave `chunked_prefill` and `async_scheduling`
-    # at None so vLLM 0.21's own auto-resolution decides (both default ON for
-    # non-encoder-decoder models with mp/uniproc executors). Prefix caching is
-    # an explicit opt-in: it changes the rollout→training logprob path because
-    # cached prefixes survive across weight updates; the trainer calls
-    # reset_prefix_cache after every broadcast (see broadcast_to_vllm) so
-    # enabling it is safe, but we keep it off by default until a recipe is
-    # validated end-to-end.
+    # vLLM throughput features. `chunked_prefill` and `async_scheduling` stay None so vLLM's own
+    # auto-resolution decides (both default ON for non-encoder-decoder models with mp/uniproc executors).
     parser.add_argument(
         "--vllm.enable_prefix_caching",
         action=argparse.BooleanOptionalAction,
@@ -881,7 +916,8 @@ if __name__ == "__main__":
         default=False,
         help="R3: capture the rollout router's per-token expert selection (vLLM) and replay it in "
         "the training forward (AutoModel RouterReplay) so MoE training/rollout routing match. "
-        "MoE models only; incompatible with --train.partial_rollout_enable (preemption drops routing).",
+        "MoE models only; turns on --vllm.enable_prefix_caching (the capture requires it); incompatible "
+        "with --train.partial_rollout_enable (preemption drops routing).",
     )
     # Debug / repro: dump a rollout batch and replay it train-only (skip generation) to
     # iterate on the training+refit path in isolation; check_weight_update_equal checks every broadcast.
@@ -1063,7 +1099,23 @@ if __name__ == "__main__":
             "n_samples_per_prompt must be greater than 1 when using dynamic filtering"
         )
 
-    if args.algo.advantage.is_correction_level == "off":
+    if args.algo.advantage.score_centering_top_k:  # the IS-composition constraint is PolicyLoss's
+        if args.train.max_epochs != 1:
+            # The centered term is the REINFORCE score; a second epoch over the same batch moves the
+            # policy ratio off 1 and the clipped surrogate no longer is that score.
+            raise ValueError(
+                "--algo.advantage.score_centering_top_k needs one update per batch (--train.max_epochs 1)"
+            )
+        if args.rollout.top_p != 1.0 or args.rollout.temperature <= 0:
+            # The head plus the reconstructed tail must be the distribution the engine actually sampled
+            # from; a top-p nucleus truncates the tail and greedy decoding has no distribution at all.
+            raise ValueError("score centering needs --rollout.top_p 1.0 and --rollout.temperature > 0")
+        if args.fsdp.tp_size > 1:
+            raise ValueError("score centering requires --fsdp.tp_size 1 (the head is not vocab-parallel yet)")
+
+    # Score centering is itself the off-policy correction (the centered score is unbiased under the
+    # rollout policy), so it may train async / partial rollouts without an importance ratio.
+    if args.algo.advantage.is_correction_level == "off" and not args.algo.advantage.score_centering_top_k:
         # The HTTP router path can't observe a mid-request weight swap, so off_policy_len is always 0
         # (no slime-style masking of stale-weight tokens). Async rollout (crosses broadcasts between
         # requests) and partial rollout (preempts mid-request at every weight sync) both then feed
@@ -1113,6 +1165,12 @@ if __name__ == "__main__":
         # rollout preempts in-flight requests at every weight sync -> the routing
         # for those tokens would be lost. Keep partial rollout off under R3.
         raise ValueError("--train.routing_replay is incompatible with --train.partial_rollout_enable.")
+
+    if args.train.routing_replay and not args.vllm.enable_prefix_caching:
+        # vLLM's routed-experts capture (the AuxOutput connector) refuses to start without prefix
+        # caching; the trainer invalidates the cache after every weight broadcast either way.
+        print("[routing_replay] enabling --vllm.enable_prefix_caching: vLLM's routed-experts capture requires it.")
+        args.vllm.enable_prefix_caching = True
 
     if args.train.routing_replay and args.vllm.mtp_num_speculative_tokens > 0:
         # The engine's routed-experts capture misaligns under speculative decoding:

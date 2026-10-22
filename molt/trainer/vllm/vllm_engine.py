@@ -229,6 +229,14 @@ class RolloutRayActor:
             args=(metas,),
         )
 
+    async def begin_weight_update(self):
+        # The reload tears the model down layer by layer, so a step during the refit would be a bug.
+        assert await self.llm.is_paused(), "begin_weight_update needs pause_generation first"
+        await self.llm.collective_rpc("begin_weight_update")
+
+    async def end_weight_update(self):
+        await self.llm.collective_rpc("end_weight_update")
+
     async def reset_weight_update_check(self):
         await self.llm.collective_rpc("reset_weight_update_check")
 
@@ -290,6 +298,7 @@ def create_vllm_engines(
     mm_encoder_attn_backend: Optional[str] = None,
     gdn_prefill_backend: Optional[str] = None,
     attention_backend: Optional[str] = None,
+    moe_backend: Optional[str] = None,
     mamba_ssm_cache_dtype: Optional[str] = None,
     distributed_executor_backend: Optional[str] = None,
     enable_expert_parallel: bool = False,
@@ -311,6 +320,7 @@ def create_vllm_engines(
     enable_return_routed_experts: bool = False,
     pipeline_parallel_size: int = 1,
     data_parallel_size: int = 1,
+    max_logprobs: int = 0,
 ):
     """Spin up a set of vLLM Ray actors on a dedicated placement group.
 
@@ -467,6 +477,9 @@ def create_vllm_engines(
             # avoid AOT-compiled FlashAttention 2 PTX kernels on older drivers).
             actor_kwargs["attention_backend"] = attention_backend
 
+        if moe_backend:
+            actor_kwargs["moe_backend"] = moe_backend
+
         if block_size:
             # KV cache block size (tokens). MiniMax-M3's MSA sparse attention
             # mandates a 128-token block; vLLM's default (16) leaves no common
@@ -514,6 +527,8 @@ def create_vllm_engines(
             # the OAI server may serve external top_logprobs>1; vLLM's default
             # (20) covers both. Capping at 1 would reject those requests.
             actor_kwargs["logprobs_mode"] = logprobs_mode
+        if max_logprobs > 20:  # score centering records top-k per token; raise vLLM's default cap of 20
+            actor_kwargs["max_logprobs"] = max_logprobs
 
         # MTP speculative decoding (rollout-side). method="mtp" is required: vLLM
         # then resolves the per-architecture MTP draft from the served target's

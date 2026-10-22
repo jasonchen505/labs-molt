@@ -15,8 +15,9 @@
 
 """Real vllm-router in front of the engine servers, + the rollout transport over it.
 
-The router load-balances the engines' OpenAI API (default consistent_hash: ``x-session-id`` affinity
-so a rollout's render+generate co-locate on one engine); weight sync bypasses it (NCCL to the engines). Everything the runners generate goes over HTTP through the router via
+The router load-balances the engines' OpenAI API (default cache_aware: each request follows its token
+prefix to the engine already serving that rollout while load is even, else the shortest queue); weight
+sync bypasses it (NCCL to the engines). Everything the runners generate goes over HTTP through the router via
 one client, ``RouterGenerateClient.generate(token_ids, sp, mm) -> (RequestOutput, off_policy_len)``:
 token-in / token-out over vLLM's ``/inference/v1/generate`` (VLM images are rendered server-side
 first, over ``/v1/chat/completions/render``, for their mm features). Both the StepEnvRunner and the
@@ -62,7 +63,7 @@ class VllmRouterActor:
             s.bind((host, 0))
             return s.getsockname()[1]
 
-    def __init__(self, worker_urls, *, policy="consistent_hash", port=None, max_payload_mb=512):
+    def __init__(self, worker_urls, *, policy="cache_aware", balance=(10, 1.2), port=None, max_payload_mb=512):
         import subprocess
         import sys
 
@@ -83,6 +84,15 @@ class VllmRouterActor:
                 str(self._free_port(self._host)),
                 "--policy",
                 policy,
+                # cache_aware keeps its prefix placement until (max - min) > abs AND max > rel * min.
+                # The router's 64 / 1.5 are sized for a serving fleet: one rollout batch puts only
+                # `rollout.generate_batch_size` requests in flight across the engines, so a gap above 64
+                # is unreachable and one slow engine kept filling until its KV cache thrashed. vime
+                # runs the same workload at 10 / 1.2 (vime/backends/vllm_utils/arguments.py).
+                "--balance-abs-threshold",
+                str(balance[0]),
+                "--balance-rel-threshold",
+                str(balance[1]),
                 "--max-payload-size",
                 str(max_payload_mb * 1024 * 1024),  # token-id / embed payloads are large
                 "--worker-urls",
@@ -124,7 +134,7 @@ def _inference_sampling_params(sp) -> dict:
     want raw action text)."""
     fields = {
         "max_tokens": sp.max_tokens,
-        "logprobs": 1,
+        "logprobs": getattr(sp, "logprobs", None) or 1,
         "temperature": sp.temperature,
         "top_p": sp.top_p,
         "skip_special_tokens": getattr(sp, "skip_special_tokens", True),
@@ -153,6 +163,18 @@ def _inference_sampling_params(sp) -> dict:
         v = getattr(sp, name, None)
         if v:
             fields[name] = list(v)
+    # The runner decodes the action text from the ids itself, so skip vLLM's frontend detokenizer
+    # (with top-k logprobs it re-decodes every candidate of every token and pins that process at
+    # 100% CPU; stop STRINGS are the one thing that needs it). Top-k logprobs go to vLLM's flat
+    # per-request storage instead of one dict of Logprob objects per token.
+    if "stop" not in fields:
+        fields["detokenize"] = False
+    if fields["logprobs"] > 1:
+        fields["flat_logprobs"] = True
+        if "stop" in fields:
+            # Under the detokenizer vLLM 0.31.0 names a top_logprobs entry by its text only, so the
+            # candidate id is lost; stop_token_ids keep the ids.
+            raise ValueError("score centering (top-k logprobs) does not support stop strings; use stop_token_ids")
     return fields
 
 
@@ -213,11 +235,10 @@ class RouterGenerateClient:
 
     async def generate(self, prompt_token_ids, sampling_params, multi_modal_data=None, session_id=None):
         prompt = list(prompt_token_ids)
-        # ``session_id`` pins every request it tags to ONE engine (``x-session-id`` + the router's
-        # consistent_hash policy). The runner passes ONE id per rollout, so all of a rollout's turns —
-        # and each turn's render + generate — co-locate: render's mm features resolve on the engine that
-        # generates, and (with prefix caching on) the multi-turn KV prefix stays warm. vime/slime pin
-        # the same way, per sample. Falls back to a per-call id when the caller passes none.
+        # One ``session_id`` per rollout goes out as ``x-session-id``. The default cache_aware policy
+        # ignores headers and places each generate by its token prefix, so a rollout's turns (each
+        # extending the last) stay on one engine until load skews; the header is the routing key only
+        # under ``--vllm.router_policy consistent_hash``. Falls back to a per-call id when none is passed.
         sid = session_id or uuid4().hex
         features = None
         if multi_modal_data and multi_modal_data.get("image"):
@@ -278,6 +299,20 @@ class RouterGenerateClient:
         if any("logprob" not in item for item in content):
             raise RuntimeError("/inference/v1/generate returned a logprobs.content entry without a logprob field.")
         logprobs = [{t: SimpleNamespace(logprob=float(item["logprob"]))} for t, item in zip(ids, content)]
+        # Score centering (sampling_params.logprobs = k > 1): the sampler's top-k per token as two
+        # [n, k] arrays, the sampled token leading each row. vLLM >= 0.31.1 names the candidate with
+        # a `token_id` field, 0.31.0 only as the "token_id:<id>" string.
+        top_logprobs = None
+        if (getattr(sampling_params, "logprobs", None) or 1) > 1:
+            k = sampling_params.logprobs
+            heads = [item.get("top_logprobs") or [] for item in content]
+            if any(len(h) != k for h in heads):
+                raise RuntimeError(f"/inference/v1/generate returned a top_logprobs row without exactly {k} entries.")
+            top_logprobs = (
+                np.array([e.get("token_id", e["token"].rsplit(":", 1)[-1]) for h in heads for e in h], dtype=np.int64),
+                np.array([e["logprob"] for h in heads for e in h], dtype=np.float32),
+            )
+            top_logprobs = tuple(a.reshape(len(heads), k) for a in top_logprobs)
         fr = c.get("finish_reason")
         finish_reason = fr.get("type") if isinstance(fr, dict) else (fr or "stop")
         # routed_experts is the UNIFIED full-sequence [tokens,layer,topk] npy (prompt+gen); absorb_routing
@@ -291,6 +326,7 @@ class RouterGenerateClient:
             text="",  # /inference/v1/generate is token-only; the runner decodes text from token_ids
             finish_reason=finish_reason,
             logprobs=logprobs,
+            top_logprobs=top_logprobs,
             routed_experts=routed_experts,
         )
         # off_policy_len=0: the HTTP transport can't observe a mid-request weight-swap boundary and
@@ -398,12 +434,13 @@ class AgentRunnerActor:
         return results
 
 
-def create_vllm_router(engines, *, policy="consistent_hash", port=None):
+def create_vllm_router(engines, *, policy="cache_aware", balance=(10, 1.2), port=None):
     """Serve each engine's OpenAI API + launch the vllm-router in front; return (router, url).
 
-    Default policy ``consistent_hash`` routes by the ``x-session-id`` header so a rollout's render +
-    generate land on ONE engine (mm-feature cache affinity — see ``RouterGenerateClient.generate``);
-    prefix caching is off, so ``cache_aware`` would add no KV reuse to trade for that affinity."""
+    Default policy ``cache_aware``: a generate goes to the engine whose radix tree holds its token
+    prefix, so a rollout's turns stay together, and to the shortest queue once engines fall out of
+    balance. ``consistent_hash`` hashed the per-rollout ``x-session-id`` blind to load, so engines
+    filled unevenly and the slow one thrashed its KV cache."""
     engine_urls = ray.get([e.serve_openai.remote() for e in engines])
-    router = VllmRouterActor.remote(engine_urls, policy=policy, port=port)
+    router = VllmRouterActor.remote(engine_urls, policy=policy, balance=balance, port=port)
     return router, ray.get(router.ready.remote())

@@ -197,6 +197,7 @@ Common RL switches:
 | Filter by agent scores | `--algo.dynamic_filtering_enable --algo.dynamic_filtering_range 0.0 1.0` |
 | Correct async rollout logprobs | `--algo.advantage.is_correction_level geo` (seq-mask-tis; token-level adds `--algo.advantage.is_correction_mode clip/trunc/mask`) |
 | FlashREINFORCE (critic-free, single-rollout) | `--train.force_on_policy --algo.advantage.estimator flash_reinforce --algo.advantage.is_correction_level seq --algo.advantage.is_correction_gating binary_kl --algo.advantage.is_correction_threshold 5e-3 --actor.loss_agg_mode seq-mean-token-mean` — see [the quick start](examples/scripts/quick_start/rl_flash_reinforce_r1d_1p5b.sh) |
+| Score centering (off-policy REINFORCE without IS) | `--algo.advantage.score_centering_top_k 32`: records the rollout sampler's top-k log-probs per token and subtracts its expected score from the policy loss ([paper](https://arxiv.org/abs/2609.20807)). Use it **instead of** an IS gate (`is_correction_level off`), or compose it with a token-level weight only: `--algo.advantage.is_correction_level token --algo.advantage.is_correction_mode trunc` (the paper's TIS variant) or `mode mask` (IcePop-style MIS). It cannot be stacked on the sequence-level gate the FlashREINFORCE recipe uses (`is_correction_level seq/geo`): a sequence gate has no per-candidate form, and its surviving tokens keep the raw ratio, under which the centering term is identically zero |
 | Freeze MoE routing (stabilize MoE RL) | `--actor.freeze_moe_router` |
 | On-policy distillation | `--algo.advantage.estimator on_policy_distill --ref.model_name_or_path /path/to/teacher` |
 | Independent eval sampling | `--eval.temperature`, `--eval.top_p`, `--eval.max_new_tokens`, `--eval.n_samples_per_prompt` (unset ones fall back to rollout) |
@@ -557,12 +558,13 @@ Molt targets AutoModel custom models with FSDP2.
 | Data parallel | `--vllm.data_parallel_size 4` | single-node mp; raises EP past TP (DeepSeek-V3-style TP8 + DP4 → EP32) |
 | Scheduler token budget | `--vllm.max_num_batched_tokens 32768` | |
 | MTP speculative decoding | `--vllm.mtp_num_speculative_tokens 1` | details in [Deep dives](#-deep-dives) |
+| MoE kernel backend | `--vllm.moe_backend triton` | default lets vLLM choose (FlashInfer TRT-LLM on Blackwell) |
 
 **MoE stability**
 
 | Mode | Flag | Note |
 |---|---|---|
-| Router replay (R3) | `--train.routing_replay` | details in [Deep dives](#-deep-dives) |
+| Router replay (R3) | `--train.routing_replay` | turns on prefix caching (vLLM's capture requires it); details in [Deep dives](#-deep-dives) |
 | Router freeze | `--actor.freeze_moe_router` | |
 
 Context parallelism is delegated to AutoModel's `ContextParallelSharder`, so each model gets the sharding
@@ -608,10 +610,66 @@ The named schemes and their prior art:
 | `level token mode clip` | token clip | per-token weight clamp |
 | `level geo mode mask` | seq-mask-tis (recipe default) | MIS-style sequence masked importance sampling |
 | `level seq mode mask` | product-ratio reject | sequence log-ratio sum |
+| `score_centering_top_k 32` (+ optional `level token mode trunc\|mask`) | score centering (no ratio; optionally on top of TIS / IcePop) | Score Centering |
 
 References: **TIS** (truncated importance sampling of the train/infer ratio), **IcePop**
-(token-level masking of out-of-band ratios), and **MIS** (masked importance sampling, Yingru Li —
-sequence-level masked IS, which motivates the `seq`/`geo` rejection filter).
+(token-level masking of out-of-band ratios), **MIS** (masked importance sampling, Yingru Li —
+sequence-level masked IS, which motivates the `seq`/`geo` rejection filter), and
+**Score Centering** ([arXiv 2609.20807](https://arxiv.org/abs/2609.20807)).
+
+**Score centering** (`--algo.advantage.score_centering_top_k k`)
+
+*The problem in one sentence.* The rollout engine (vLLM) and the trainer (FSDP) are two different
+implementations of the same model, so they disagree slightly on every token's probability; plain
+REINFORCE then nudges the trainer toward the engine's preferences at every token, even when the
+reward is zero. That nudge is the drift.
+
+*Notation.* Look at one position of one response. The engine picked token `y` from its
+distribution `q`; the trainer assigns the same position its own distribution `p`; `v` runs over
+the vocabulary; `∇` is the gradient with respect to the trainer's weights.
+
+*Where the drift comes from.* REINFORCE's per-token update is `advantage × ∇log p_y`. Because `y`
+was drawn from `q`, the average of `∇log p_y` over the engine's sampling is
+
+```
+E_{y~q}[∇log p_y]  =  Σ_v q_v ∇log p_v
+```
+
+If engine and trainer agreed (`q = p`) this is `Σ_v p_v ∇log p_v = Σ_v ∇p_v = ∇1 = 0`: with no
+reward signal there is no net push. When they disagree it is not zero, so every update carries a
+reward-independent push — the drift.
+
+*What score centering does.* It subtracts the average push before the advantage is applied:
+
+```
+train on   log p_y  −  Σ_v q_v log p_v        instead of   log p_y
+```
+
+The gradient of the subtracted term is exactly `Σ_v q_v ∇log p_v`, so the expected update at every
+position becomes zero: the drift is gone and no sample is thrown away. The engine only reports its
+top-k log-probs per token, so the sum runs over those `k` tokens and the remaining probability mass
+is approximated by a rescaled `p` (the paper's tail term; `k = 32` recovers ~95 % of the mass).
+
+*With TIS or IcePop.* These keep the REINFORCE update but scale the sampled token by a per-token
+weight `f(r)` of the train/rollout ratio `r = p_y / q_y` (TIS: `min(r, c)`; IcePop: `r` inside a
+band, 0 outside). Score centering then subtracts the average of the *weighted* push,
+`Σ_v q_v f(r_v) log p_v`. This stays exact because `f` only needs `(p, q)` at this position, so it
+can be evaluated for every candidate `v`.
+
+*FlashREINFORCE needs none of this.* Its recipe applies the exact ratio `r = p/q` to every surviving
+token and drops whole responses whose train/rollout mismatch is too large (the `seq`/`geo` gate).
+With the exact ratio the average push is `Σ_v q_v (p_v / q_v) ∇log p_v = ∇ Σ_v p_v = 0`: importance
+sampling already removes the drift, and the gate only bounds the variance. Simple, and drift-free by
+construction. For the same reason score centering cannot be stacked on it: with `f(r) = r` the
+centering term is identically zero, and the gate decides keep-or-drop from later tokens, so no
+per-candidate correction exists — `PolicyLoss` rejects the pair.
+
+| You want | Flags |
+|---|---|
+| Score centering alone (replaces the IS correction) | `--algo.advantage.score_centering_top_k 32 --algo.advantage.is_correction_level off` |
+| Score centering + TIS | `... --algo.advantage.is_correction_level token --algo.advantage.is_correction_mode trunc` |
+| Score centering + IcePop | `... --algo.advantage.is_correction_level token --algo.advantage.is_correction_mode mask` |
+| The `seq`/`geo` gate (FlashREINFORCE recipe) | keep the gate, do not add score centering (`PolicyLoss` rejects the pair) |
 
 </details>
 
@@ -684,9 +742,9 @@ expert ids it chose, and the training forward replays that exact selection.
   on preemption).
 
 **Router freeze (optional, blunter).** Hold the gate/router weights fixed so the
-routing can't drift at all — excludes the router from the optimizer *and* the refit,
-so vLLM and the actor route to the same experts **by construction**, no engine
-support needed. The trade-off: the router stops learning, so it's **redundant with
+routing can't drift at all — the router leaves the optimizer (the refit still broadcasts
+it, unchanged), so vLLM and the actor route to the same experts **by construction**, no
+engine support needed. The trade-off: the router stops learning, so it's **redundant with
 R3** and off by default; reach for it only if routing drift still dominates and a
 fixed router is acceptable.
 
@@ -695,6 +753,25 @@ fixed router is acceptable.
 ```
 
 </details>
+
+### 🧪 Train–inference consistency — bitwise rollout vs. trainer logprobs
+
+IS correction and R3 re-weight or mask the train/rollout gap; the complementary route removes it:
+the training forward calls vLLM's own kernels for every value-producing operator and only adds a
+backward, so the trainer's per-token logprob is byte-identical to the one vLLM sampled with. Molt
+ships this as an agent skill, [`.claude/skills/train-inference-consistency`](.claude/skills/train-inference-consistency/SKILL.md):
+gates G0–G8, per-operator numerical contracts, molt flags and patch points, mismatch debugging and
+paired acceptance, written for the FSDP2 + AutoModel + vLLM stack and inspired by the vLLM blog post
+[Finish RL Training Faster: Bitwise-Consistent, High-Performance, Agent-Driven](https://vllm-project.github.io/2026/10/14/train-inference-consistency.html) (verl + Megatron).
+
+Measure it with `mismatch/bitwise_frac` (fraction of valid response tokens whose fp32 logprob bytes
+differ between vLLM and the training forward; logged whenever rollout logprobs exist, i.e.
+`--algo.advantage.is_correction_level` ≠ `off` or score centering), plus `mismatch/abs_diff_mean` and
+`mismatch/k3_kl`. Bitwise means `bitwise_frac = 0` at every step of a synchronous run
+(`--train.force_sync_mode`, queue 1, one epoch); under any lag the rollout came from older weights and
+the fraction reads ≈ 1 whatever the kernels. `vllm_kl` is a signed mean and cannot tell a last-bit
+difference from 0. The aligned kernels (`--train.batch_invariant`) are being upstreamed from the
+reference branch; `main` ships the metrics, rollout dump/replay and the skill.
 
 ### 🧩 LoRA fine-tuning
 
