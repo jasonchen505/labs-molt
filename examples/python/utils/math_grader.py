@@ -57,8 +57,8 @@ def _strip_prompt(query: str, prompt: Any) -> str:
     return query
 
 
-def _last_braced_command(text: str, command: str) -> str | None:
-    matches = list(re.finditer(rf"{re.escape(command)}\s*{{", text))
+def _last_braced_answer(text: str) -> str | None:
+    matches = list(re.finditer(r"\\(?:boxed|fbox)\s*{", text))
     for match in reversed(matches):
         start = match.end()
         depth = 1
@@ -80,10 +80,9 @@ def extract_answer(text: str) -> str | None:
     if not text:
         return None
 
-    for command in (r"\boxed", r"\fbox"):
-        boxed = _last_braced_command(text, command)
-        if boxed:
-            return boxed
+    boxed = _last_braced_answer(text)
+    if boxed:
+        return boxed
 
     answer_matches = list(
         re.finditer(
@@ -175,6 +174,7 @@ def _fix_sqrt(string: str) -> str:
 
 
 def _strip_string(string: str) -> str:
+    string = _inject_implicit_mixed_number(string)
     string = string.replace("\n", "")
     string = string.replace("\\!", "")
     string = string.replace("\\\\", "\\")
@@ -289,8 +289,9 @@ def _str_to_int(x: str) -> int:
 
 
 def _inject_implicit_mixed_number(step: str) -> str:
-    # e.g. "7 3/4" => "7+3/4"
-    return re.compile("([0-9]) +([0-9])").sub("\\1+\\2", step)
+    # Preserve the mixed-number boundary before stripping whitespace; parentheses
+    # keep a leading minus on the whole value: "-7 3/4" => "-(7+3/4)".
+    return re.sub(r"(?<![\w.])(-?)(\d+)\s+(\d+\s*/\s*\d+)", r"\1(\2+\3)", step)
 
 
 def _strip_properly_formatted_commas(expr: str) -> str:

@@ -31,13 +31,6 @@ _spec = importlib.util.spec_from_file_location("math_grader", _MG)
 mg = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(mg)
 
-try:
-    import sympy  # noqa: F401
-
-    HAVE_SYMPY = True
-except Exception:
-    HAVE_SYMPY = False
-
 # Must be judged EQUAL (resolvable by string/normalization, no sympy).
 MATCH = [
     ("36", r"36^\circ"),
@@ -74,6 +67,17 @@ NOMATCH = [
 ]
 
 
+@pytest.mark.parametrize("first,last", [(r"\boxed", r"\fbox"), (r"\fbox", r"\boxed")])
+@pytest.mark.parametrize("trailing", ["", r" and an unfinished \boxed{9", r" and an unfinished \fbox{9"])
+def test_score_response_uses_last_balanced_answer_across_box_types(first, last, trailing):
+    response = first + "{7} then " + last + r"{\frac{1}{2}}" + trailing
+
+    result = mg.score_response(response, "", {"ground_truth": "0.5"})
+    assert result["prediction"] == r"\frac{1}{2}"
+    assert result["reward"] == 1.0
+    assert mg.score_response(response, "", {"ground_truth": "7"})["reward"] == 0.0
+
+
 @pytest.mark.parametrize("prompt", ["What is 1 * 7?", r"Check \boxed{7}."])
 @pytest.mark.parametrize("response", ["", "I do not know."])
 def test_score_response_does_not_extract_an_answer_from_the_prompt(prompt, response):
@@ -94,6 +98,31 @@ def test_score_response_grades_the_response_with_or_without_a_prompt(prompt, res
 
     assert result["reward"] == reward
     assert result["missing_answer"] == 0.0
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.parametrize(
+    "answer,target,reward",
+    [
+        ("7 3/4", "31/4", 1.0),
+        ("7 3/4", "73/4", 0.0),
+        ("7  3 / 4", "73/4", 0.0),
+        ("-7 3/4", "-31/4", 1.0),
+        ("-7 3/4", "-73/4", 0.0),
+        ("-7 3/4", "-25/4", 0.0),
+        ("17 13/14", "251/14", 1.0),
+        ("17 13/14", "1713/14", 0.0),
+    ],
+)
+def test_score_response_preserves_mixed_numbers(answer, target, reward, reverse):
+    if reward:
+        pytest.importorskip("sympy")
+    if reverse:
+        answer, target = target, answer
+
+    result = mg.score_response(r"\boxed{" + answer + "}", "", {"ground_truth": target})
+
+    assert result["reward"] == reward
 
 
 def test_math_env_grading_keeps_event_loop_responsive(monkeypatch):
@@ -128,7 +157,7 @@ def test_math_env_grading_keeps_event_loop_responsive(monkeypatch):
     assert loop_remained_responsive
 
 
-def main() -> None:
+def test_answer_equivalence() -> None:
     fails = []
     for a, b in MATCH:
         if not mg.answers_match(a, b):
@@ -142,24 +171,24 @@ def main() -> None:
     if r["reward"] != 1.0:
         fails.append(f"score_response boxed-degree reward={r['reward']} (expected 1.0)")
 
-    if HAVE_SYMPY:
-        for a, b in MATCH_SYMPY:
-            if not mg.answers_match(a, b):
-                fails.append(f"EXPECTED MATCH (sympy) but differ: {a!r} vs {b!r}")
-        rs = mg.score_response(r"\boxed{\frac{1}{2}}", "", {"ground_truth": "0.5"})
-        if rs["reward"] != 1.0:
-            fails.append(f"score_response nested-boxed reward={rs['reward']} (expected 1.0)")
-        note = "sympy cases RAN"
-    else:
-        note = "sympy cases SKIPPED"
+    assert not fails, "\n".join(fails)
 
-    if fails:
-        print(f"FAILED ({len(fails)}):")
-        for f in fails:
-            print("  -", f)
-        raise SystemExit(1)
-    print(f"ALL GRADER TESTS PASSED. {note}")
+
+def test_answer_equivalence_sympy() -> None:
+    """The cases that need sympy's symbolic comparison: skipped, not silently passed, without it."""
+    pytest.importorskip("sympy")
+    fails = []
+    for a, b in MATCH_SYMPY:
+        if not mg.answers_match(a, b):
+            fails.append(f"EXPECTED MATCH (sympy) but differ: {a!r} vs {b!r}")
+
+    rs = mg.score_response(r"\boxed{\frac{1}{2}}", "", {"ground_truth": "0.5"})
+    if rs["reward"] != 1.0:
+        fails.append(f"score_response nested-boxed reward={rs['reward']} (expected 1.0)")
+
+    assert not fails, "\n".join(fails)
 
 
 if __name__ == "__main__":
-    main()
+    test_answer_equivalence()
+    test_answer_equivalence_sympy()

@@ -21,6 +21,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import pytest
+
 _AGENT_PATH = Path(__file__).resolve().parents[2] / "examples" / "python" / "agents" / "geo3k.py"
 
 
@@ -86,6 +88,55 @@ def test_step_terminates_on_nested_boxed_answer_with_tool_call(monkeypatch):
     assert result.terminated is True
     assert result.reward.item() == 1.0
     assert env.tool_call_count == 0
+
+
+@pytest.mark.parametrize("module_name", ["geo3k", "chat_geo3k"])
+def test_final_answer_takes_the_last_box_whichever_command_it_uses(monkeypatch, module_name):
+    """Guards the grader helper both agents reach into: it was renamed under them once."""
+    mod = geo3k if module_name == "geo3k" else _load_chat_geo3k(monkeypatch)
+
+    assert mod._final_answer(r"\boxed{7} then \fbox{\frac{1}{2}}") == r"\frac{1}{2}"
+    assert mod._final_answer(r"\fbox{7} then \boxed{\frac{1}{2}}") == r"\frac{1}{2}"
+    assert mod._final_answer(r"\boxed{7} and an unfinished \fbox{9") == "7"
+    assert mod._final_answer("<answer>5</answer>") == "5"
+
+
+def test_step_parser_initialization_keeps_event_loop_responsive(monkeypatch):
+    started = threading.Event()
+    release = threading.Event()
+    timed_out = threading.Event()
+    load_count = 0
+
+    class NoToolParser:
+        def extract_tool_calls(self, text, request=None):
+            return SimpleNamespace(tools_called=False, tool_calls=[])
+
+    def slow_load_parser():
+        nonlocal load_count
+        load_count += 1
+        started.set()
+        if not release.wait(timeout=1):
+            timed_out.set()
+        return NoToolParser()
+
+    monkeypatch.setattr(geo3k, "_PARSER", None)
+    monkeypatch.setattr(geo3k, "_load_parser", slow_load_parser)
+
+    async def run_steps():
+        tasks = [
+            asyncio.create_task(geo3k.GeoEnv().step({"action_text": "reasoning", "label": None})) for _ in range(2)
+        ]
+        while not started.is_set():
+            await asyncio.sleep(0)
+        loop_remained_responsive = not timed_out.is_set()
+        release.set()
+        return await asyncio.gather(*tasks), loop_remained_responsive
+
+    results, loop_remained_responsive = asyncio.run(run_steps())
+
+    assert all(result.terminated for result in results)
+    assert load_count == 1
+    assert loop_remained_responsive
 
 
 def test_step_continues_on_tool_call_without_answer(monkeypatch):
@@ -211,6 +262,57 @@ def _run_chat_agent(monkeypatch, chat_geo3k, replies, max_turns):
         label="",
     )
     return asyncio.run(chat_geo3k.Geo3kAgent().run(ctx)), create, executed
+
+
+def test_chat_agent_parser_initialization_keeps_event_loop_responsive(monkeypatch):
+    chat_geo3k = _load_chat_geo3k(monkeypatch)
+    started = threading.Event()
+    release = threading.Event()
+    timed_out = threading.Event()
+    load_count = 0
+
+    class NoToolParser:
+        def extract_tool_calls(self, text, request=None):
+            return SimpleNamespace(tools_called=False, tool_calls=[])
+
+    def slow_load_parser():
+        nonlocal load_count
+        load_count += 1
+        started.set()
+        if not release.wait(timeout=1):
+            timed_out.set()
+        return NoToolParser()
+
+    async def create(**kwargs):
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="reasoning"))])
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    monkeypatch.setattr(chat_geo3k, "AsyncOpenAI", lambda **kwargs: client)
+    monkeypatch.setattr(chat_geo3k, "_PARSER", None)
+    monkeypatch.setattr(chat_geo3k, "_load_parser", slow_load_parser)
+    ctx = SimpleNamespace(
+        base_url="http://localhost/v1",
+        api_key="EMPTY",
+        messages=[],
+        tools=[],
+        model_name="policy",
+        sampling_params=SimpleNamespace(max_tokens=8, temperature=1.0),
+        label="",
+    )
+
+    async def run_agents():
+        tasks = [asyncio.create_task(chat_geo3k.Geo3kAgent().run(ctx)) for _ in range(2)]
+        while not started.is_set():
+            await asyncio.sleep(0)
+        loop_remained_responsive = not timed_out.is_set()
+        release.set()
+        return await asyncio.gather(*tasks), loop_remained_responsive
+
+    results, loop_remained_responsive = asyncio.run(run_agents())
+
+    assert len(results) == 2
+    assert load_count == 1
+    assert loop_remained_responsive
 
 
 def test_chat_agent_marks_last_tool_call_turn_truncated_without_running_the_tool(monkeypatch):

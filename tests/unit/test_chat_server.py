@@ -329,6 +329,54 @@ def test_template_rewritten_history_starts_fresh_segment():
     assert len(out) == 2 and all(t.reward == 1.0 for t in out)
 
 
+@pytest.mark.parametrize(
+    "new_messages",
+    [
+        [{"role": "tool", "content": "OBS1"}, {"role": "tool", "content": "OBS2"}],  # parallel tool results
+        [],  # the reply alone: the agent asks the model to keep going
+    ],
+)
+def test_continuation_delta_covers_every_message_after_the_reply(new_messages):
+    # A continuation turn is the previous request + the reply + ANY number of new messages. The delta
+    # must hold exactly the new ones: slicing at the last message dropped all but one of several tool
+    # results, and re-sent the reply itself as feedback when nothing followed it.
+    a1, a2 = "A1", "A2"
+    engine = _DriftyEngine([_dact(_ids(a1), [-0.1] * len(a1)), _dact(_ids(a2), [-0.2] * len(a2))])
+    proc = _DriftyProc()
+    state = ChatServerState(engine, proc, "policy", 10000, _sampling())
+    state.open("sid", "P", "lab", None)
+    session = state.sessions["sid"]
+
+    msgs = [{"role": "user", "content": "Q0"}]
+    act1, _ = _drive(state, session, msgs)
+    _drive(state, session, msgs + [{"role": "assistant", "content": act1}] + new_messages)
+
+    turn1_prompt = _ids(proc.apply_chat_template(msgs, add_generation_prompt=True))
+    delta2 = _ids(proc.apply_chat_template(new_messages, add_generation_prompt=True))
+    # Every new message reached the model, and only once (decoded so a failure shows the text).
+    assert proc.decode(engine.prompts[1]) == proc.decode(turn1_prompt + _ids(a1) + delta2)
+    assert len(session.trajectories) == 1
+    assert session.trajectories[0].observation_tokens == turn1_prompt + _ids(a1) + delta2 + _ids(a2)
+
+
+def test_turn_without_the_reply_starts_fresh_segment():
+    # A request that extends the previous one without echoing the model's reply rewrites the history the
+    # segment holds (the reply is in it), so it seals the segment like a compaction, never slices a delta.
+    engine = _DriftyEngine([_dact(_ids("A1"), [-0.1, -0.1]), _dact(_ids("A2"), [-0.2, -0.2])])
+    proc = _DriftyProc()
+    state = ChatServerState(engine, proc, "policy", 10000, _sampling())
+    state.open("sid", "P", "lab", None)
+    session = state.sessions["sid"]
+
+    msgs = [{"role": "user", "content": "Q0"}]
+    _drive(state, session, msgs)
+    msgs = msgs + [{"role": "user", "content": "OBS1"}]
+    _drive(state, session, msgs)
+
+    assert len(session.trajectories) == 2
+    assert engine.prompts[1] == _ids(proc.apply_chat_template(msgs, add_generation_prompt=True))
+
+
 def test_run_turn_replays_retried_turn_idempotently(monkeypatch):
     _patch_prompts(monkeypatch, [[1, 2]])
     state, tp = _state([_act([90], [-0.1])])
@@ -752,3 +800,37 @@ def test_chat_request_cannot_change_rollout_temperature_or_top_p():
     with pytest.warns(UserWarning, match="ignored"):
         sp = cs._build_sampling_params(base, {"temperature": 0.2, "top_p": 0.5, "max_tokens": 7})
     assert (sp.temperature, sp.top_p, sp.max_tokens, sp.logprobs) == (1.0, 1.0, 7, 1)
+
+
+class _KnobThinkProc(_PositionalThinkProc):
+    """Nemotron-3-style template: drops earlier turns' <think> unless truncate_history_thinking=False."""
+
+    chat_template = "{% set truncate_history_thinking = truncate_history_thinking | default(true) %}..."
+
+    def __init__(self):
+        self.kwargs_seen = []
+
+    def apply_chat_template(self, chat, tokenize=False, add_generation_prompt=False, **kwargs):
+        self.kwargs_seen.append(kwargs)
+        if kwargs.get("truncate_history_thinking", True):
+            return super().apply_chat_template(chat, tokenize, add_generation_prompt)
+        return _DriftyProc.apply_chat_template(self, chat, tokenize, add_generation_prompt)
+
+
+def test_history_thinking_kept_when_the_template_has_the_knob():
+    a1, a2 = "<think>T</think>ANS", "A2"
+    engine = _DriftyEngine([_dact(_ids(a1), [-0.1] * len(a1)), _dact(_ids(a2), [-0.2] * len(a2))])
+    proc = _KnobThinkProc()  # chat_template mentions the knob -> rendered with it off
+    state = ChatServerState(engine, proc, "policy", 10000, _sampling())
+    state.open("sid", "P", "lab", None)
+    session = state.sessions["sid"]
+
+    msgs = [{"role": "user", "content": "Q0"}]
+    act1, _ = _drive(state, session, msgs)
+    msgs = msgs + [{"role": "assistant", "content": act1}, {"role": "user", "content": "OBS1"}]
+    _drive(state, session, msgs)
+
+    assert proc.kwargs_seen and all(k.get("truncate_history_thinking") is False for k in proc.kwargs_seen)
+    # History renders as generated -> prefix-stable -> one segment with two actions, not one segment per turn.
+    assert len(session.trajectories) == 1 and len(session.trajectories[0].action_ranges) == 2
+    assert "<think>T</think>" in proc.decode(engine.prompts[1])  # the policy sees its own earlier reasoning
