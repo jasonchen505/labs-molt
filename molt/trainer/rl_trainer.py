@@ -253,7 +253,7 @@ def compute_eval_metrics(eval_dataloader, samples_list, n_samples_per_prompt):
 
 
 class BaseRLTrainer:
-    """Training-side base class for non-critic policy RL."""
+    """Training-side base class for policy RL (trains the critic too when one is given)."""
 
     def __init__(
         self,
@@ -627,7 +627,9 @@ class GenerateSamplesActor:
         # first node with free CPUs, and that node's port range then runs out.
         agent_runners = [
             AgentRunnerActor.options(scheduling_strategy="SPREAD").remote(
-                strategy.args.train.agent_path, router_url, model_path=pretrain
+                strategy.args.train.agent_path,
+                router_url,
+                model_path=pretrain,
             )
             for _ in range(num_runners)
         ]

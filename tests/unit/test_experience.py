@@ -77,7 +77,11 @@ def _grpo_maker():
     new step on the compute_advantages path does not need another binding here."""
     args = SimpleNamespace(
         reward=SimpleNamespace(clip_range=None, overlong_buffer_len=None, stop_properly_penalty_coef=None),
-        algo=SimpleNamespace(advantage=SimpleNamespace(estimator="grpo", gamma=1.0, lam=1.0, no_whiten=False)),
+        algo=SimpleNamespace(
+            advantage=SimpleNamespace(
+                estimator="grpo", gamma=1.0, lam=1.0, length_adaptive_alpha=None, no_whiten=False
+            )
+        ),
         rollout=SimpleNamespace(n_samples_per_prompt=4),
     )
     return RemoteExperienceMaker(None, None, SimpleNamespace(value=0.0), SimpleNamespace(args=args), None)
@@ -198,7 +202,11 @@ def _make_experience_with_rollout_reference(monkeypatch, use_loss, rollout_log_p
             experience.action_log_probs = action_log_probs
 
     monkeypatch.setattr(maker, "_dispatch_forward", _fake_dispatch)
+    # The runners offload every sample before it reaches the controller (router.run_group), and the
+    # controller never reloads it, so a stub ref is enough.
+    monkeypatch.setattr(experience_mod.ray, "put", lambda obj: "heavy-ref")
     exp = Experience(action_mask=torch.ones(1, 3, dtype=torch.bool), rollout_log_probs=rollout_log_probs, info={})
+    exp.offload()
     return maker.make_experience([exp])[0], action_log_probs
 
 

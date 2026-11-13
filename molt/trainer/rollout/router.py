@@ -128,10 +128,9 @@ def _decode_routed_experts(blob):
 
 
 def _inference_sampling_params(sp) -> dict:
-    """The ``sampling_params`` object for vLLM's ``/inference/v1/generate`` (vime's shape). Forward
-    every knob set on the rollout SamplingParams so nothing is silently dropped over HTTP (only
-    non-defaults are sent); ``skip_special_tokens`` is always sent (server defaults True, rollouts
-    want raw action text)."""
+    """The ``sampling_params`` object for vLLM's ``/inference/v1/generate`` (vime's shape). Every
+    sampling knob is sent explicitly, defaults included, because the server fills an omitted one
+    from the checkpoint's generation_config; only min_tokens, seed and the stop lists are sent when set."""
     fields = {
         "max_tokens": sp.max_tokens,
         "logprobs": getattr(sp, "logprobs", None) or 1,
@@ -249,26 +248,26 @@ class RouterGenerateClient:
             _align_features_to_canonical(features, prompt, self.image_token_id)
         return await self._generate_inference(prompt, sampling_params, features, sid)
 
-    async def _post(self, path, payload, session_id, *, retries=3):
+    async def _post(self, path, payload, session_id):
         """POST to a router route (``model`` + the routing-affinity header injected), return parsed JSON.
 
-        Retries transient failures with linear backoff — a 5xx or a refused/dropped connection while
+        Tries a transient failure 20 times, a second apart — a 5xx or a refused/dropped connection while
         the router or an engine is still warming up (its port binds before its workers pass health
         checks) or is briefly overloaded — so a hiccup costs a retry, not a dropped rollout (vime/slime
         retry the same way). A 4xx is a real client bug, so it fails fast rather than burn the retry
         budget. The session sets no read timeout, so a slow generation never lands here at all."""
         headers = {"x-session-id": session_id} if session_id else None
         body = {"model": self.model_name, **payload}
-        for attempt in range(retries):
+        for attempt in range(20):
             try:
                 async with self.http.post(path, json=body, headers=headers) as resp:
                     resp.raise_for_status()
                     return await resp.json()
             except (aiohttp.ClientResponseError, aiohttp.ClientConnectionError, aiohttp.ClientPayloadError) as e:
                 fatal = isinstance(e, aiohttp.ClientResponseError) and e.status < 500  # 4xx = real bug
-                if fatal or attempt == retries - 1:
+                if fatal or attempt == 19:
                     raise
-            await asyncio.sleep(attempt + 1)
+            await asyncio.sleep(1)
 
     async def _render(self, images, session_id):
         """POST the image(s) to the stock ``/v1/chat/completions/render`` route (server-side chat
@@ -301,15 +300,19 @@ class RouterGenerateClient:
         logprobs = [{t: SimpleNamespace(logprob=float(item["logprob"]))} for t, item in zip(ids, content)]
         # Score centering (sampling_params.logprobs = k > 1): the sampler's top-k per token as two
         # [n, k] arrays, the sampled token leading each row. vLLM >= 0.31.1 names the candidate with
-        # a `token_id` field, 0.31.0 only as the "token_id:<id>" string.
+        # a `token_id` field and no `token`, 0.31.0 only the "token_id:<id>" string. vLLM >= 0.33 no longer
+        # cuts a row to k: a sampled token outside the top k makes it k + 1 long, so the cut is made here.
         top_logprobs = None
         if (getattr(sampling_params, "logprobs", None) or 1) > 1:
             k = sampling_params.logprobs
-            heads = [item.get("top_logprobs") or [] for item in content]
+            heads = [(item.get("top_logprobs") or [])[:k] for item in content]
             if any(len(h) != k for h in heads):
                 raise RuntimeError(f"/inference/v1/generate returned a top_logprobs row without exactly {k} entries.")
             top_logprobs = (
-                np.array([e.get("token_id", e["token"].rsplit(":", 1)[-1]) for h in heads for e in h], dtype=np.int64),
+                np.array(
+                    [e["token_id"] if "token_id" in e else e["token"].rsplit(":", 1)[-1] for h in heads for e in h],
+                    dtype=np.int64,
+                ),
                 np.array([e["logprob"] for h in heads for e in h], dtype=np.float32),
             )
             top_logprobs = tuple(a.reshape(len(heads), k) for a in top_logprobs)
@@ -392,7 +395,8 @@ class AgentRunnerActor:
         node's object store and only the lazy handle travels to the controller — so a 256-session
         batch of screenshots never concentrates on one node. Tagged group_id (per prompt; GRPO
         baseline) + rollout_id (per rollout; multi-turn step-samples share it). A failed/unusable
-        rollout is dropped, never sinks the group."""
+        rollout is reported with its drop reason, never raised: training then drops its whole group
+        and refills the slot, eval keeps the rest (``SamplesGenerator._filter_group``)."""
         from molt.trainer.rollout.samples_generator import SamplesGenerator
 
         group_id = group_id or uuid4().hex

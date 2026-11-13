@@ -190,7 +190,7 @@ def test_post_retries_transient_then_succeeds(monkeypatch):
 
 
 @pytest.mark.parametrize("path", [GEN, RENDER])
-@pytest.mark.parametrize("failed_attempts", [2, 3])
+@pytest.mark.parametrize("failed_attempts", [2, 20])
 def test_post_retries_interrupted_response_body(monkeypatch, path, failed_attempts):
     payload = {"ok": True}
     http = _FakeHttp({path: payload})
@@ -207,13 +207,13 @@ def test_post_retries_interrupted_response_body(monkeypatch, path, failed_attemp
     monkeypatch.setattr(_FakeResp, "json", read_body)
     monkeypatch.setattr("molt.trainer.rollout.router.asyncio.sleep", record_backoff)
     request = RouterGenerateClient(http)._post(path, {"token_ids": [1, 2]}, "stable-session")
-    if failed_attempts == 3:
+    if failed_attempts == 20:  # every one of the 20 tries failed
         with pytest.raises(aiohttp.ClientPayloadError, match="not completed"):
             asyncio.run(request)
     else:
         assert asyncio.run(request) == payload
-    assert len(http.calls) == 3
-    assert backoffs == [1, 2]
+    assert len(http.calls) == min(failed_attempts + 1, 20)
+    assert backoffs == [1] * (len(http.calls) - 1)
     assert all(
         call == (path, {"model": "policy", "token_ids": [1, 2]}, {"x-session-id": "stable-session"})
         for call in http.calls
@@ -355,6 +355,8 @@ def test_agent_runner_actor_init_is_synchronous():
     """Ray actor constructors are synchronous; an async __init__ would not be awaited."""
     actor_cls = getattr(AgentRunnerActor, "__ray_actor_class__", AgentRunnerActor)
     assert not inspect.iscoroutinefunction(actor_cls.__init__)
+
+
 
 
 def test_agent_runner_reports_each_failed_rollout():
@@ -519,6 +521,20 @@ def test_generate_forwards_logprobs_k_and_parses_top_logprobs_into_the_token_dic
     assert ro.outputs[0].logprobs[0][90].logprob == pytest.approx(-0.1)  # the sampled token's dict, as before
     ids, log_probs = ro.outputs[0].top_logprobs  # the sampler head as [n, k] arrays, engine order
     assert ids.tolist() == [[90, 7]] and log_probs[0].tolist() == pytest.approx([-0.1, -2.0])
+
+
+def test_generate_cuts_a_top_logprobs_row_to_k():
+    # vLLM >= 0.33 sends k + 1 candidates when the sampled token is outside the top k: sampled first, then the
+    # top k. Candidates carry `token_id` and no `token` (vLLM >= 0.31.1).
+    row = [{"token_id": 90, "logprob": -5.0}, {"token_id": 7, "logprob": -0.1}, {"token_id": 8, "logprob": -2.0}]
+    content = [{"token_id": 90, "logprob": -5.0, "top_logprobs": row}]
+    resp = {"choices": [{"token_ids": [90], "finish_reason": "stop", "logprobs": {"content": content}}]}
+    sp = SimpleNamespace(max_tokens=8, temperature=1.0, top_p=1.0, logprobs=2)
+
+    ro, _ = asyncio.run(RouterGenerateClient(_FakeHttp({GEN: resp})).generate([1, 2], sp))
+
+    ids, log_probs = ro.outputs[0].top_logprobs
+    assert ids.tolist() == [[90, 7]] and log_probs[0].tolist() == pytest.approx([-5.0, -0.1])
 
 
 def test_generate_skips_frontend_detokenization_unless_stop_strings_need_it():

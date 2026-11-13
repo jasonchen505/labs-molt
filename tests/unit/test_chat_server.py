@@ -377,16 +377,35 @@ def test_turn_without_the_reply_starts_fresh_segment():
     assert engine.prompts[1] == _ids(proc.apply_chat_template(msgs, add_generation_prompt=True))
 
 
-def test_run_turn_replays_retried_turn_idempotently(monkeypatch):
-    _patch_prompts(monkeypatch, [[1, 2]])
-    state, tp = _state([_act([90], [-0.1])])
+def test_resent_turn_is_sampled_again_and_the_reply_it_replaces_stays(monkeypatch):
+    # The server keeps no reply to hand back: a re-sent turn is sampled anew, whatever made the agent
+    # re-send it, in a fresh segment; the replies it replaces stay in the rollout as generated.
+    _patch_prompts(monkeypatch, [[1, 2]] * 3)
+    state, tp = _state([_act([90], [-0.1], finish="length"), _act([91], [-0.2]), _act([92], [-0.3])])
     state.open("sid", "P", "l", None)
     session = state.sessions["sid"]
-    r1 = asyncio.run(_run_turn(state, session, _MSG))
-    r2 = asyncio.run(_run_turn(state, session, {"messages": [{"role": "user", "content": "P"}]}))
-    # cached, no 2nd generate: one trajectory with a single action range
-    assert r1 == r2 and len(session.trajectories) == 1
-    assert len(session.trajectories[0].action_ranges) == 1 and len(tp.calls) == 1
+    assert asyncio.run(_run_turn(state, session, _MSG)) == ("ACT", "length")
+    assert asyncio.run(_run_turn(state, session, _MSG)) == ("ACT", "stop")  # the truncated reply, asked again
+    assert asyncio.run(_run_turn(state, session, _MSG)) == ("ACT", "stop")  # e.g. the agent could not parse it
+    assert len(tp.calls) == 3
+    assert [t.observation_tokens for t in session.trajectories] == [[1, 2, 90], [1, 2, 91], [1, 2, 92]]
+
+
+def test_reply_whose_client_hung_up_is_not_recorded(monkeypatch):
+    # The client hung up while the turn generated and asks again: only the reply it receives is recorded.
+    _patch_prompts(monkeypatch, [[1, 2]] * 2)
+    state, tp = _state([_act([90], [-0.1]), _act([91], [-0.2])])
+    state.open("sid", "P", "l", None)
+    session = state.sessions["sid"]
+
+    async def gone():
+        return True
+
+    with pytest.raises(cs.HTTPException) as hung_up:
+        asyncio.run(_run_turn(state, session, _MSG, gone))
+    assert hung_up.value.status_code == 499 and session.trajectories == []
+    asyncio.run(_run_turn(state, session, _MSG))
+    assert len(tp.calls) == 2 and [t.observation_tokens for t in session.trajectories] == [[1, 2, 91]]
 
 
 class _FlakyTransport(_FakeTransport):
@@ -793,6 +812,22 @@ def test_chatml_turn_cut_by_length_gets_the_template_end_of_turn_in_the_feedback
     _drive(state, session, msgs)
     canonical = proc.encode(proc.apply_chat_template(msgs, add_generation_prompt=True))
     assert session.trajectories[0].observation_tokens[: len(canonical)] == canonical
+
+
+def test_rollout_goes_on_past_a_truncated_reply_the_agent_acted_on():
+    # The turn was truncated twice, yet the agent found its action in the last reply and sent the
+    # next turn: that turn is generated, the rollout does not end at a truncated reply.
+    proc = _ChatMLProc()
+    cut = _dact(proc.encode("A1 cut"), [-0.1] * 6, finish="length")
+    engine = _DriftyEngine([cut, cut, _dact(proc.encode("A2" + proc.EOT), [-0.1] * 3)])
+    state = ChatServerState(engine, proc, "policy", 10000, _sampling())
+    state.open("sid", "P", "lab", None)
+    session = state.sessions["sid"]
+    msgs = [{"role": "user", "content": "Q0"}]
+    assert _drive(state, session, msgs) == ("A1 cut", "length")
+    assert _drive(state, session, msgs) == ("A1 cut", "length")  # asked again, truncated again
+    msgs = msgs + [{"role": "assistant", "content": "A1 cut"}, {"role": "user", "content": "OBS1"}]
+    assert _drive(state, session, msgs)[1] == "stop" and len(engine.prompts) == 3
 
 
 def test_chat_request_cannot_change_rollout_temperature_or_top_p():
