@@ -57,36 +57,59 @@ def _strip_prompt(query: str, prompt: Any) -> str:
     return query
 
 
-def _last_braced_answer(text: str) -> str | None:
+def _last_braced_answer_span(text: str) -> tuple[str, int] | None:
     matches = list(re.finditer(r"\\(?:boxed|fbox)\s*{", text))
     for match in reversed(matches):
         start = match.end()
         depth = 1
         chars = []
-        for char in text[start:]:
+        for offset, char in enumerate(text[start:], start=start):
             if char == "{":
                 depth += 1
             elif char == "}":
                 depth -= 1
                 if depth == 0:
-                    return "".join(chars).strip()
+                    candidate = "".join(chars).strip()
+                    if candidate:
+                        return candidate, offset + 1
+                    break
             chars.append(char)
     return None
 
 
+def _last_braced_answer(text: str) -> str | None:
+    found = _last_braced_answer_span(text)
+    return found[0] if found is not None else None
+
+
+def _last_tagged_answer_span(text: str) -> tuple[str, int] | None:
+    matches = list(re.finditer(r"<answer>\s*(.*?)\s*</answer>", text, flags=re.IGNORECASE | re.DOTALL))
+    for match in reversed(matches):
+        candidate = match.group(1).strip()
+        if candidate:
+            nested_boxed = _last_braced_answer(candidate)
+            return (nested_boxed if nested_boxed else candidate), match.end()
+    return None
+
+
 def extract_answer(text: str) -> str | None:
-    """Extract the final answer: prefer the last balanced \\boxed{}/\\fbox{},
-    then an "answer is ..." phrase, then the last number."""
+    """Extract the final answer: prefer the last explicit \\boxed{}/\\fbox{} or
+    <answer>...</answer> marker, then an "answer is ..." phrase, then the last number."""
     if not text:
         return None
 
-    boxed = _last_braced_answer(text)
+    boxed = _last_braced_answer_span(text)
+    tagged = _last_tagged_answer_span(text)
+    if boxed and tagged:
+        return tagged[0] if tagged[1] >= boxed[1] else boxed[0]
     if boxed:
-        return boxed
+        return boxed[0]
+    if tagged:
+        return tagged[0]
 
     answer_matches = list(
         re.finditer(
-            r"(?:final\s+answer|answer|therefore|thus)\s*(?:is|:|=)?\s*([^\n<|]+)",
+            r"(?<![<\w])(?:final\s+answer|answer|therefore|thus)\b(?:\s*(?:is|:|=)\s*|\s+)([^\n<|]+)",
             text,
             flags=re.IGNORECASE,
         )

@@ -208,8 +208,9 @@ def test_answer_equivalence() -> None:
 
 
 def test_answer_equivalence_sympy() -> None:
-    """The cases that need sympy's symbolic comparison: skipped, not silently passed, without it."""
+    """The cases that need sympy and pylatexenc: skipped, not silently passed, without them."""
     pytest.importorskip("sympy")
+    pytest.importorskip("pylatexenc")
     fails = []
     for a, b in MATCH_SYMPY:
         if not mg.answers_match(a, b):
@@ -220,6 +221,26 @@ def test_answer_equivalence_sympy() -> None:
         fails.append(f"score_response nested-boxed reward={rs['reward']} (expected 1.0)")
 
     assert not fails, "\n".join(fails)
+
+
+@pytest.mark.parametrize(
+    "response,target,expected_prediction,expected_reward",
+    [
+        ("<think>180 - 144 = 36</think><answer>36</answer>", "36", "36", 1.0),
+        ("<think>angle</think>\n<answer>\n36^\\circ\n</answer>", "36", "36^\\circ", 1.0),
+        (r"<answer>\boxed{\frac{1}{2}}</answer>", "0.5", r"\frac{1}{2}", 1.0),
+        (r"<think>First guess \boxed{7}</think><answer>36</answer>", "36", "36", 1.0),
+        ("<answer>7</answer> then <answer>36</answer> and truncated <answer>9", "36", "36", 1.0),
+        ("There were 5 unanswered questions; final answer: 36", "36", "36", 1.0),
+        ("The answer is x > 3", "x > 3", "x > 3", 1.0),  # an inequality is kept whole
+    ],
+)
+def test_score_response_extracts_answer_tags_and_word_bounded_phrases(
+    response, target, expected_prediction, expected_reward
+):
+    result = mg.score_response(response, "", {"ground_truth": target})
+    assert result["prediction"] == expected_prediction
+    assert result["reward"] == expected_reward
 
 
 if __name__ == "__main__":

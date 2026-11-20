@@ -30,6 +30,15 @@ Gemini CLI read directly; `.claude/skills` (Claude Code) and `.codex/skills` (ol
 are symlinks to that directory, and `CLAUDE.md` is a symlink to this file. A new skill is just its
 directory under `.agents/skills/`.
 
+## Docs
+
+Feature docs are the Markdown pages in `docs/guide/pages/`. Read the page for the area you are
+changing, and update it in the same change when the behavior it describes moves.
+Do not read the rest of `docs/`. The site shell (HTML, CSS, JS, blog) has nothing to do with code
+work, and `cli-rl.md`, `cli-sft.md`, and `api-agents.md` are generated from the source and only
+repeat it. `.ignore` keeps both out of ripgrep searches. After changing a CLI flag or
+`molt.agents`, run `python docs/guide/build_reference.py`.
+
 ## Workflow
 
 - Reviews report findings only; fixes ship as one minimal diff per issue
